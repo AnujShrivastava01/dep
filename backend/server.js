@@ -40,8 +40,8 @@ if (process.env.NODE_ENV !== "production") {
   io = null;
 }
 
-// Connect to MongoDB
-connectDB();
+// Connect to MongoDB (non-blocking for Vercel)
+connectDB().catch(console.error);
 
 // Middleware
 app.use(helmet());
