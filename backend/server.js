@@ -13,26 +13,32 @@ const Message = require("./models/Message");
 const HelpRequest = require("./models/HelpRequest");
 const User = require("./models/User");
 require("dotenv").config();
-const aiRoutes = require('./routes/ai');
+const aiRoutes = require("./routes/ai");
 
-
-const aiChatbotRoutes = require('./routes/aiChatbot');
+const aiChatbotRoutes = require("./routes/aiChatbot");
 
 const authRoutes = require("./routes/auth");
 const requestRoutes = require("./routes/requests");
 const messageRoutes = require("./routes/messages");
 
 const app = express();
-const server = createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: [
-      process.env.FRONTEND_URL || "http://localhost:8000",
-    ],
-    methods: ["GET", "POST"],
-    credentials: true
-  }
-});
+
+// Only create server and socket.io for local development
+let server, io;
+if (process.env.NODE_ENV !== "production") {
+  server = createServer(app);
+  io = new Server(server, {
+    cors: {
+      origin: [process.env.FRONTEND_URL || "http://localhost:8000"],
+      methods: ["GET", "POST"],
+      credentials: true,
+    },
+  });
+} else {
+  // For production (Vercel), we'll disable Socket.IO for now
+  server = null;
+  io = null;
+}
 
 // Connect to MongoDB
 connectDB();
@@ -66,7 +72,7 @@ app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use("/uploads", express.static("uploads"));
 
 // Create uploads directory if it doesn't exist
-const uploadsDir = path.join(__dirname, 'uploads');
+const uploadsDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadsDir)) {
   fs.mkdirSync(uploadsDir, { recursive: true });
 }
@@ -77,38 +83,54 @@ const storage = multer.diskStorage({
     cb(null, uploadsDir);
   },
   filename: function (req, file, cb) {
-    const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
-  }
+    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+    cb(
+      null,
+      file.fieldname + "-" + uniqueSuffix + path.extname(file.originalname)
+    );
+  },
 });
 
-const upload = multer({ 
+const upload = multer({
   storage: storage,
   limits: {
-    fileSize: 10 * 1024 * 1024 // 10MB limit
+    fileSize: 10 * 1024 * 1024, // 10MB limit
   },
   fileFilter: function (req, file, cb) {
     // Allow images and common file types
     const allowedTypes = /jpeg|jpg|png|gif|pdf|doc|docx|txt|zip|rar/;
-    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const extname = allowedTypes.test(
+      path.extname(file.originalname).toLowerCase()
+    );
     const mimetype = allowedTypes.test(file.mimetype);
-    
+
     if (mimetype && extname) {
       return cb(null, true);
     } else {
-      cb(new Error('Only image and document files are allowed!'));
+      cb(new Error("Only image and document files are allowed!"));
     }
-  }
+  },
 });
 
 // Routes
 app.use("/api/auth", authRoutes);
 app.use("/api/requests", requestRoutes);
 app.use("/api/messages", messageRoutes);
-app.use('/api/ai-chatbot', aiChatbotRoutes);
-app.use('/api/ai-help', aiRoutes);
-// Make socket.io instance available to routes
-app.set('io', io);
+app.use("/api/ai-chatbot", aiChatbotRoutes);
+app.use("/api/ai-help", aiRoutes);
+
+// Root route for testing
+app.get("/", (req, res) => {
+  res.json({
+    message: "SkillBridge Backend API is running!",
+    status: "active",
+    timestamp: new Date().toISOString(),
+    version: "1.0.0",
+  });
+});
+
+// Make socket.io instance available to routes (if available)
+app.set("io", io);
 
 // Health check endpoints
 app.get("/health", async (req, res) => {
@@ -162,231 +184,242 @@ app.get("/", (req, res) => {
   });
 });
 
-// Store connected users and their rooms
-const connectedUsers = new Map(); // userId -> socket
-const userRooms = new Map(); // userId -> Set of roomIds
-const roomUsers = new Map(); // roomId -> Set of userIds
+// Store connected users and their rooms (only for local development)
+let connectedUsers, userRooms, roomUsers;
 
-// Socket connection handler
-io.use((socket, next) => {
-  const userId = socket.handshake.auth.userId;
-  if (userId) {
-    socket.userId = userId;
-    next();
-  } else {
-    next(new Error('Authentication error'));
-  }
-});
+if (io) {
+  connectedUsers = new Map(); // userId -> socket
+  userRooms = new Map(); // userId -> Set of roomIds
+  roomUsers = new Map(); // roomId -> Set of userIds
 
-io.on('connection', (socket) => {
-  const userId = socket.userId;
-  console.log(`🔌 User connected: ${userId} (Socket: ${socket.id})`);
-  
-  // Store user connection
-  connectedUsers.set(userId, socket);
-  
-  // Initialize user's room tracking
-  if (!userRooms.has(userId)) {
-    userRooms.set(userId, new Set());
-  }
-
-  // Join room handler
-  socket.on('join_room', async (data) => {
-    const { requestId, userId } = data;
-    console.log(`🏠 User ${userId} joining room: ${requestId}`);
-    
-    try {
-      // Verify user has access to this request
-      const request = await HelpRequest.findById(requestId);
-      if (!request) {
-        console.log(`❌ Request ${requestId} not found`);
-        return;
-      }
-      
-      // Check if user is requester or helper
-      const isRequester = request.requester.toString() === userId;
-      const isHelper = request.helper && request.helper.toString() === userId;
-      
-      if (!isRequester && !isHelper) {
-        console.log(`❌ User ${userId} not authorized for request ${requestId}`);
-        return;
-      }
-      
-      // Join the room
-      socket.join(requestId);
-      
-      // Update tracking
-      userRooms.get(userId).add(requestId);
-      if (!roomUsers.has(requestId)) {
-        roomUsers.set(requestId, new Set());
-      }
-      roomUsers.get(requestId).add(userId);
-      
-      // Notify other users in the room
-      socket.to(requestId).emit('user_joined_room', {
-        requestId,
-        userId,
-        timestamp: new Date().toISOString()
-      });
-      
-      console.log(`✅ User ${userId} joined room ${requestId}`);
-      
-    } catch (error) {
-      console.error(`❌ Error joining room: ${error.message}`);
+  // Socket connection handler
+  io.use((socket, next) => {
+    const userId = socket.handshake.auth.userId;
+    if (userId) {
+      socket.userId = userId;
+      next();
+    } else {
+      next(new Error("Authentication error"));
     }
   });
 
-  // Leave room handler
-  socket.on('leave_room', (data) => {
-    const { requestId, userId } = data;
-    console.log(`🏠 User ${userId} leaving room: ${requestId}`);
-    
-    socket.leave(requestId);
-    
-    // Update tracking
-    const userRoomsSet = userRooms.get(userId);
-    if (userRoomsSet) {
-      userRoomsSet.delete(requestId);
-    }
-    
-    const roomUsersSet = roomUsers.get(requestId);
-    if (roomUsersSet) {
-      roomUsersSet.delete(userId);
-      if (roomUsersSet.size === 0) {
-        roomUsers.delete(requestId);
-      }
-    }
-    
-    // Notify other users in the room
-    socket.to(requestId).emit('user_left_room', {
-      requestId,
-      userId,
-      timestamp: new Date().toISOString()
-    });
-    
-    console.log(`✅ User ${userId} left room ${requestId}`);
-  });
-
-  // Send message handler
-  socket.on('send_message', async (messageData) => {
-    const { requestId, content, messageType, fileName, fileSize } = messageData;
-    const senderId = socket.userId;
-    
-    console.log(`📤 Message from ${senderId} in room ${requestId}:`, content);
-    
-    try {
-      // Get user details
-      const user = await User.findById(senderId);
-      if (!user) {
-        console.log(`❌ User ${senderId} not found`);
-        return;
-      }
-      
-      // Create message object
-      const message = {
-        requestId,
-        senderId,
-        senderName: user.name,
-        senderPicture: user.picture,
-        content,
-        messageType: messageType || 'text',
-        fileName,
-        fileSize,
-        createdAt: new Date().toISOString(),
-        isRead: false
-      };
-      
-      // Save to database
-      const newMessage = new Message({
-        request: requestId,
-        sender: senderId,
-        content,
-        messageType: messageType || 'text',
-        fileName,
-        fileSize,
-        isRead: false
-      });
-      
-      const savedMessage = await newMessage.save();
-      
-      // Add database ID to message
-      message._id = savedMessage._id;
-      
-      // Broadcast to room
-      io.to(requestId).emit('message', message);
-      
-      // Send notification to other users in the room
-      const roomUsersSet = roomUsers.get(requestId);
-      if (roomUsersSet) {
-        roomUsersSet.forEach(userId => {
-          if (userId !== senderId) {
-            const userSocket = connectedUsers.get(userId);
-            if (userSocket) {
-              userSocket.emit('notification', {
-                requestId,
-                message: `New message from ${user.name}`,
-                senderName: user.name,
-                timestamp: new Date().toISOString()
-              });
-            }
-          }
-        });
-      }
-      
-      console.log(`✅ Message sent and broadcasted to room ${requestId}`);
-      
-    } catch (error) {
-      console.error(`❌ Error sending message: ${error.message}`);
-      socket.emit('error', { message: 'Failed to send message' });
-    }
-  });
-
-  // Typing indicator handler
-  socket.on('typing', (data) => {
-    const { requestId, userId, userName, isTyping } = data;
-    console.log(`⌨️ Typing indicator from ${userName} in room ${requestId}: ${isTyping}`);
-    
-    // Broadcast typing indicator to other users in the room
-    socket.to(requestId).emit('typing', {
-      requestId,
-      userId,
-      userName,
-      isTyping,
-      timestamp: new Date().toISOString()
-    });
-  });
-
-  // Disconnect handler
-  socket.on('disconnect', () => {
+  io.on("connection", (socket) => {
     const userId = socket.userId;
-    console.log(`🔌 User disconnected: ${userId}`);
-    
-    // Clean up user tracking
-    connectedUsers.delete(userId);
-    
-    // Leave all rooms
-    const userRoomsSet = userRooms.get(userId);
-    if (userRoomsSet) {
-      userRoomsSet.forEach(requestId => {
-        const roomUsersSet = roomUsers.get(requestId);
-        if (roomUsersSet) {
-          roomUsersSet.delete(userId);
-          if (roomUsersSet.size === 0) {
-            roomUsers.delete(requestId);
-          }
+    console.log(`🔌 User connected: ${userId} (Socket: ${socket.id})`);
+
+    // Store user connection
+    connectedUsers.set(userId, socket);
+
+    // Initialize user's room tracking
+    if (!userRooms.has(userId)) {
+      userRooms.set(userId, new Set());
+    }
+
+    // Join room handler
+    socket.on("join_room", async (data) => {
+      const { requestId, userId } = data;
+      console.log(`🏠 User ${userId} joining room: ${requestId}`);
+
+      try {
+        // Verify user has access to this request
+        const request = await HelpRequest.findById(requestId);
+        if (!request) {
+          console.log(`❌ Request ${requestId} not found`);
+          return;
         }
-        
-        // Notify other users
-        socket.to(requestId).emit('user_left_room', {
+
+        // Check if user is requester or helper
+        const isRequester = request.requester.toString() === userId;
+        const isHelper = request.helper && request.helper.toString() === userId;
+
+        if (!isRequester && !isHelper) {
+          console.log(
+            `❌ User ${userId} not authorized for request ${requestId}`
+          );
+          return;
+        }
+
+        // Join the room
+        socket.join(requestId);
+
+        // Update tracking
+        userRooms.get(userId).add(requestId);
+        if (!roomUsers.has(requestId)) {
+          roomUsers.set(requestId, new Set());
+        }
+        roomUsers.get(requestId).add(userId);
+
+        // Notify other users in the room
+        socket.to(requestId).emit("user_joined_room", {
           requestId,
           userId,
-          timestamp: new Date().toISOString()
+          timestamp: new Date().toISOString(),
         });
+
+        console.log(`✅ User ${userId} joined room ${requestId}`);
+      } catch (error) {
+        console.error(`❌ Error joining room: ${error.message}`);
+      }
+    });
+
+    // Leave room handler
+    socket.on("leave_room", (data) => {
+      const { requestId, userId } = data;
+      console.log(`🏠 User ${userId} leaving room: ${requestId}`);
+
+      socket.leave(requestId);
+
+      // Update tracking
+      const userRoomsSet = userRooms.get(userId);
+      if (userRoomsSet) {
+        userRoomsSet.delete(requestId);
+      }
+
+      const roomUsersSet = roomUsers.get(requestId);
+      if (roomUsersSet) {
+        roomUsersSet.delete(userId);
+        if (roomUsersSet.size === 0) {
+          roomUsers.delete(requestId);
+        }
+      }
+
+      // Notify other users in the room
+      socket.to(requestId).emit("user_left_room", {
+        requestId,
+        userId,
+        timestamp: new Date().toISOString(),
       });
-      userRooms.delete(userId);
-    }
+
+      console.log(`✅ User ${userId} left room ${requestId}`);
+    });
+
+    // Send message handler
+    socket.on("send_message", async (messageData) => {
+      const { requestId, content, messageType, fileName, fileSize } =
+        messageData;
+      const senderId = socket.userId;
+
+      console.log(`📤 Message from ${senderId} in room ${requestId}:`, content);
+
+      try {
+        // Get user details
+        const user = await User.findById(senderId);
+        if (!user) {
+          console.log(`❌ User ${senderId} not found`);
+          return;
+        }
+
+        // Create message object
+        const message = {
+          requestId,
+          senderId,
+          senderName: user.name,
+          senderPicture: user.picture,
+          content,
+          messageType: messageType || "text",
+          fileName,
+          fileSize,
+          createdAt: new Date().toISOString(),
+          isRead: false,
+        };
+
+        // Save to database
+        const newMessage = new Message({
+          request: requestId,
+          sender: senderId,
+          content,
+          messageType: messageType || "text",
+          fileName,
+          fileSize,
+          isRead: false,
+        });
+
+        const savedMessage = await newMessage.save();
+
+        // Add database ID to message
+        message._id = savedMessage._id;
+
+        // Broadcast to room (only if Socket.IO is available)
+        if (io) {
+          io.to(requestId).emit("message", message);
+
+          // Send notification to other users in the room
+          const roomUsersSet = roomUsers.get(requestId);
+          if (roomUsersSet) {
+            roomUsersSet.forEach((userId) => {
+              if (userId !== senderId) {
+                const userSocket = connectedUsers.get(userId);
+                if (userSocket) {
+                  userSocket.emit("notification", {
+                    requestId,
+                    message: `New message from ${user.name}`,
+                    senderName: user.name,
+                    timestamp: new Date().toISOString(),
+                  });
+                }
+              }
+            });
+          }
+        } // End of if (io) block
+
+        console.log(`✅ Message sent and broadcasted to room ${requestId}`);
+      } catch (error) {
+        console.error(`❌ Error sending message: ${error.message}`);
+        if (io) {
+          socket.emit("error", { message: "Failed to send message" });
+        }
+      }
+    });
+
+    // Typing indicator handler
+    socket.on("typing", (data) => {
+      const { requestId, userId, userName, isTyping } = data;
+      console.log(
+        `⌨️ Typing indicator from ${userName} in room ${requestId}: ${isTyping}`
+      );
+
+      // Broadcast typing indicator to other users in the room
+      socket.to(requestId).emit("typing", {
+        requestId,
+        userId,
+        userName,
+        isTyping,
+        timestamp: new Date().toISOString(),
+      });
+    });
+
+    // Disconnect handler
+    socket.on("disconnect", () => {
+      const userId = socket.userId;
+      console.log(`🔌 User disconnected: ${userId}`);
+
+      // Clean up user tracking
+      connectedUsers.delete(userId);
+
+      // Leave all rooms
+      const userRoomsSet = userRooms.get(userId);
+      if (userRoomsSet) {
+        userRoomsSet.forEach((requestId) => {
+          const roomUsersSet = roomUsers.get(requestId);
+          if (roomUsersSet) {
+            roomUsersSet.delete(userId);
+            if (roomUsersSet.size === 0) {
+              roomUsers.delete(requestId);
+            }
+          }
+
+          // Notify other users
+          socket.to(requestId).emit("user_left_room", {
+            requestId,
+            userId,
+            timestamp: new Date().toISOString(),
+          });
+        });
+        userRooms.delete(userId);
+      }
+    });
   });
-});
+} // End of if (io) block
 
 // Error handling middleware
 app.use((err, req, res, next) => {
@@ -405,7 +438,7 @@ const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Socket.io server ready for connections`);
-  console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
+  console.log(`Environment: ${process.env.NODE_ENV || "development"}`);
 });
 
 // Export for Vercel
@@ -415,20 +448,20 @@ module.exports = app;
 async function saveMessage(data) {
   try {
     const { requestId, senderId, receiverId, message, senderName } = data;
-    
+
     const newMessage = new Message({
       request: requestId,
       sender: senderId,
       receiver: receiverId,
       message,
-      messageType: 'text'
+      messageType: "text",
     });
 
     await newMessage.save();
 
     const populatedMessage = await Message.findById(newMessage._id)
-      .populate('sender', 'name email picture')
-      .populate('receiver', 'name email picture');
+      .populate("sender", "name email picture")
+      .populate("receiver", "name email picture");
 
     return populatedMessage;
   } catch (error) {
@@ -440,28 +473,33 @@ async function saveMessage(data) {
 // Function to save file messages using Message model
 async function saveFileMessage(data) {
   try {
-    const { requestId, senderId, receiverId, message, fileData, senderName } = data;
-    
+    const { requestId, senderId, receiverId, message, fileData, senderName } =
+      data;
+
     const newMessage = new Message({
       request: requestId,
       sender: senderId,
       receiver: receiverId,
-      message: message || `Sent a ${fileData.mimeType.startsWith('image/') ? 'image' : 'file'}`,
-      messageType: fileData.mimeType.startsWith('image/') ? 'image' : 'file',
+      message:
+        message ||
+        `Sent a ${fileData.mimeType.startsWith("image/") ? "image" : "file"}`,
+      messageType: fileData.mimeType.startsWith("image/") ? "image" : "file",
       fileData: {
         fileName: fileData.fileName,
         fileUrl: fileData.fileUrl,
         fileSize: fileData.fileSize,
         mimeType: fileData.mimeType,
-        thumbnailUrl: fileData.mimeType.startsWith('image/') ? fileData.fileUrl : null
-      }
+        thumbnailUrl: fileData.mimeType.startsWith("image/")
+          ? fileData.fileUrl
+          : null,
+      },
     });
 
     await newMessage.save();
 
     const populatedMessage = await Message.findById(newMessage._id)
-      .populate('sender', 'name email picture')
-      .populate('receiver', 'name email picture');
+      .populate("sender", "name email picture")
+      .populate("receiver", "name email picture");
 
     return populatedMessage;
   } catch (error) {
@@ -470,4 +508,5 @@ async function saveFileMessage(data) {
   }
 }
 
-module.exports = { app, io };
+// For Vercel serverless deployment
+module.exports = app;
