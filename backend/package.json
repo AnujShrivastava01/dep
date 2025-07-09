@@ -14,7 +14,8 @@
     "deploy": "npm run seed && npm start",
     "deploy:dev": "cp env.development .env && npm run seed && npm start",
     "deploy:prod": "cp env.production .env && npm run seed && npm start",
-    "postinstall": "npm run build"
+    "postinstall": "npm run build",
+    "vercel-build": "npm run build"
   },
   "dependencies": {
     "axios": "^1.10.0",
@@ -35,5 +36,8 @@
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
